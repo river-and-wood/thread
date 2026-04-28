@@ -32,5 +32,9 @@ target_link_libraries(lock_demo PRIVATE concurrency_locks)
 add_executable(lock_tests tests/lock_tests.cpp)
 target_link_libraries(lock_tests PRIVATE concurrency_locks)
 
+add_executable(stress_tests tests/stress_tests.cpp)
+target_link_libraries(stress_tests PRIVATE concurrency_locks)
+
 enable_testing()
 add_test(NAME lock_tests COMMAND lock_tests)
+add_test(NAME stress_tests COMMAND stress_tests)

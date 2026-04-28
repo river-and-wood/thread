@@ -18,6 +18,7 @@ namespace concurrency {
 // 状态模型：
 // - 读线程只要没有写线程持锁，就可以共同进入。
 // - 写线程必须等到没有读线程、也没有其他写线程时才能进入。
+// - 多个写线程会按 ticket 顺序获取写锁，避免写线程之间无序竞争。
 class SharedMutex : private NonCopyable {
 public:
     SharedMutex();
@@ -58,6 +59,17 @@ private:
     //
     // 这是一个简化写优先策略，不是严格 FIFO 公平队列。
     std::atomic<int> waiting_writers_;
+
+    // 下一个写线程要领取的 ticket。
+    // 每个调用 lock() 的写线程都会通过 fetch_add 获取一个唯一编号。
+    std::atomic<unsigned long long> next_writer_ticket_;
+
+    // 当前允许尝试获取写锁的 ticket。
+    // 只有 my_ticket == serving_writer_ticket_ 的写线程才允许竞争 state_。
+    std::atomic<unsigned long long> serving_writer_ticket_;
+
+    // 所有写线程都必须通过 writer ticket 进入。
+    // lock() 会等待自己的 ticket，try_lock() 只有在没有排队写线程时才会预留当前 ticket。
 };
 
 } // namespace concurrency

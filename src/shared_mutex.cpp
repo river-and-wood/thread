@@ -6,18 +6,33 @@ namespace concurrency {
 
 SharedMutex::SharedMutex()
     : state_(0),
-      waiting_writers_(0) {
+      waiting_writers_(0),
+      next_writer_ticket_(0),
+      serving_writer_ticket_(0) {
     // state_ = 0 表示初始时没有读线程，也没有写线程。
     // waiting_writers_ = 0 表示初始时没有等待写锁的线程。
+    // writer ticket 从 0 开始递增，serving ticket 表示当前轮到哪个写线程。
 }
 
 void SharedMutex::lock() {
+    // 写线程先领取一个全局递增 ticket。
+    // 这个 ticket 决定多个写线程之间的进入顺序。
+    const unsigned long long my_ticket =
+        next_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+
     // 当前线程准备申请写锁，先登记为等待写线程。
     // 新来的读线程看到 waiting_writers_ > 0 后会暂缓进入，
     // 这样可以降低写线程被连续读线程饿死的概率。
     waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
 
     for (;;) {
+        // 如果还没有轮到自己的 ticket，当前写线程不能竞争 state_。
+        // 这样可以避免多个写线程同时 CAS state_，保证写线程 FIFO。
+        if (serving_writer_ticket_.load(std::memory_order_acquire) != my_ticket) {
+            std::this_thread::yield();
+            continue;
+        }
+
         // CAS 的期望值。只有 state_ 仍然等于 0，CAS 才会成功。
         // 每一轮都要重新设置为 0，因为 CAS 失败时会把真实 state_ 写回该变量。
         int expected_state = 0;
@@ -43,17 +58,45 @@ bool SharedMutex::try_lock() {
     // expected_state 被设置为 0，表示只有完全空闲时才能拿到写锁。
     int expected_state = 0;
 
+    // try_lock 也必须遵守 writer ticket。
+    // 只有 next_writer_ticket_ == serving_writer_ticket_ 时，才说明没有写线程排队。
+    const unsigned long long serving_ticket =
+        serving_writer_ticket_.load(std::memory_order_acquire);
+    unsigned long long expected_next_ticket = serving_ticket;
+
+    // 预留当前 serving ticket。预留失败说明已有写线程领取了 ticket，
+    // 当前 try_lock 不能插队，直接失败。
+    if (!next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
+                                                     serving_ticket + 1,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed)) {
+        return false;
+    }
+
     // 只有无人持锁时，才能把 state_ 从 0 改成 -1。
-    return state_.compare_exchange_strong(expected_state,
-                                          -1,
-                                          std::memory_order_acquire,
-                                          std::memory_order_relaxed);
+    const bool locked = state_.compare_exchange_strong(expected_state,
+                                                       -1,
+                                                       std::memory_order_acquire,
+                                                       std::memory_order_relaxed);
+
+    if (!locked) {
+        // 已经预留了一个 ticket，但没有拿到锁。
+        // 必须推进 serving_writer_ticket_ 跳过这个未使用的 ticket，
+        // 否则后续写线程会永远等在这个 ticket 上。
+        serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    return locked;
 }
 
 void SharedMutex::unlock() {
     // 写线程释放锁时，把 -1 改回 0。
     // release 发布写临界区内对共享数据的修改。
     state_.store(0, std::memory_order_release);
+
+    // 所有写线程都持有一个 writer ticket。
+    // 释放写锁后推进 ticket，让下一个写线程有资格竞争。
+    serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void SharedMutex::lock_shared() {

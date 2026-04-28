@@ -104,6 +104,8 @@ locked_.clear(std::memory_order_release);
 ```cpp
 std::atomic<int> state_;
 std::atomic<int> waiting_writers_;
+std::atomic<unsigned long long> next_writer_ticket_;
+std::atomic<unsigned long long> serving_writer_ticket_;
 ```
 
 `state_` 含义：
@@ -117,6 +119,16 @@ std::atomic<int> waiting_writers_;
 - 当前正在等待写锁的线程数量。
 - 读线程会检查它，避免在写线程等待时继续插队。
 
+`next_writer_ticket_` 含义：
+
+- 下一个阻塞式写线程要领取的 ticket 编号。
+- 每次 `lock()` 调用都会通过 `fetch_add(1)` 获取唯一编号。
+
+`serving_writer_ticket_` 含义：
+
+- 当前轮到哪个写线程尝试获取写锁。
+- 只有 `my_ticket == serving_writer_ticket_` 的写线程才允许 CAS `state_`。
+
 ### lock()
 
 写线程获取独占锁。
@@ -124,9 +136,17 @@ std::atomic<int> waiting_writers_;
 核心逻辑：
 
 ```cpp
+const unsigned long long my_ticket =
+    next_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+
 waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
 
 for (;;) {
+    if (serving_writer_ticket_.load(std::memory_order_acquire) != my_ticket) {
+        std::this_thread::yield();
+        continue;
+    }
+
     int expected_state = 0;
     if (state_.compare_exchange_weak(expected_state,
                                      -1,
@@ -141,11 +161,13 @@ for (;;) {
 
 执行过程：
 
-1. 写线程先增加 `waiting_writers_`。
-2. 只有当 `state_ == 0` 时，说明没有读线程也没有写线程。
-3. 写线程用 CAS 把 `state_` 从 `0` 改成 `-1`。
-4. 修改成功表示获得写锁。
-5. 修改失败表示存在读线程或其他写线程，继续自旋等待。
+1. 写线程先从 `next_writer_ticket_` 领取自己的 `my_ticket`。
+2. 写线程增加 `waiting_writers_`，通知新读线程暂缓进入。
+3. 只有当 `my_ticket == serving_writer_ticket_` 时，当前写线程才有资格竞争写锁。
+4. 只有当 `state_ == 0` 时，说明没有读线程也没有写线程。
+5. 写线程用 CAS 把 `state_` 从 `0` 改成 `-1`。
+6. 修改成功表示获得写锁。
+7. 修改失败表示仍有读线程或 CAS 虚假失败，继续自旋等待。
 
 ### try_lock()
 
@@ -155,16 +177,36 @@ for (;;) {
 
 ```cpp
 int expected_state = 0;
-return state_.compare_exchange_strong(expected_state,
-                                      -1,
-                                      std::memory_order_acquire,
-                                      std::memory_order_relaxed);
+const unsigned long long serving_ticket =
+    serving_writer_ticket_.load(std::memory_order_acquire);
+unsigned long long expected_next_ticket = serving_ticket;
+
+if (!next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
+                                                 serving_ticket + 1,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_relaxed)) {
+    return false;
+}
+
+const bool locked = state_.compare_exchange_strong(expected_state,
+                                                   -1,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed);
+
+if (!locked) {
+    serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+return locked;
 ```
 
 执行过程：
 
 - `state_ == 0`：改成 `-1`，获取成功。
 - `state_ != 0`：不等待，直接失败。
+- `try_lock()` 也必须先预留 writer ticket。
+- 如果已经有写线程排队，`try_lock()` 预留 ticket 失败，直接返回失败，避免插队。
+- 如果预留 ticket 后没有拿到锁，需要推进 `serving_writer_ticket_` 跳过这个未使用 ticket。
 
 ### unlock()
 
@@ -174,12 +216,14 @@ return state_.compare_exchange_strong(expected_state,
 
 ```cpp
 state_.store(0, std::memory_order_release);
+serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 执行过程：
 
 - 当前写线程把状态从 `-1` 恢复为 `0`。
 - release 内存序保证写线程临界区的数据修改被后续读/写线程看见。
+- 推进 `serving_writer_ticket_`，让下一个写线程继续。
 
 ### lock_shared()
 
@@ -332,7 +376,7 @@ private:
 
 - 竞争严重或临界区很长时会浪费 CPU。
 - 没有进入内核等待队列，不能像系统互斥锁一样睡眠等待。
-- 公平性是简化版本，只通过 `waiting_writers_` 降低写线程饥饿概率。
+- 公平性仍不是完整读写线程统一 FIFO；当前只保证阻塞式写线程 FIFO，并通过 `waiting_writers_` 降低写线程饥饿概率。
 - 没有记录 owner，错误 unlock 不会被诊断。
 - 不支持超时接口。
 - 不支持递归锁。
@@ -569,6 +613,8 @@ W 一直等不到 state_ == 0
 所以写线程等待前先执行：
 
 ```cpp
+const unsigned long long my_ticket =
+    next_writer_ticket_.fetch_add(1);
 waiting_writers_.fetch_add(1);
 ```
 
@@ -586,8 +632,9 @@ if (waiting_writers_.load() > 0) {
 - 已经进入的读线程可以正常退出。
 - 新读线程不再插队。
 - 写线程更容易等到 `state_ == 0`。
+- 多个写线程之间按 ticket 顺序进入，避免写线程之间无序抢锁。
 
-这是一种简化写优先策略，不是严格 FIFO 公平队列。
+这是一种“写线程 FIFO + 简化写优先”的策略。它比普通 CAS 抢锁更可控，但仍不是完整的读写线程统一 FIFO 队列。
 
 ### 9.7 SharedMutex 状态图
 

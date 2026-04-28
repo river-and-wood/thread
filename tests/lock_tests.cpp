@@ -139,6 +139,31 @@ void test_shared_mutex_try_lock() {
     shared_mutex.unlock();
 }
 
+void test_shared_mutex_failed_try_lock_does_not_block_writers() {
+    // 这个测试覆盖 writer ticket 的边界情况：
+    // try_lock 会先预留一个 writer ticket，如果随后因为读锁存在而失败，
+    // 它必须推进 serving ticket 跳过这个未使用 ticket。
+    concurrency::SharedMutex shared_mutex;
+    std::atomic<bool> writer_finished(false);
+
+    shared_mutex.lock_shared();
+    assert(!shared_mutex.try_lock());
+
+    std::thread writer([&]() {
+        concurrency::UniqueLockGuard<concurrency::SharedMutex> write_guard(shared_mutex);
+        writer_finished.store(true);
+    });
+
+    // 读锁仍然持有时，写线程不应该能完成。
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(!writer_finished.load());
+
+    // 释放读锁后，如果 try_lock 失败路径正确推进了 ticket，写线程应能完成。
+    shared_mutex.unlock_shared();
+    writer.join();
+    assert(writer_finished.load());
+}
+
 } // namespace
 
 int main() {
@@ -147,5 +172,6 @@ int main() {
     test_shared_mutex_allows_multiple_readers();
     test_shared_mutex_writer_is_exclusive();
     test_shared_mutex_try_lock();
+    test_shared_mutex_failed_try_lock_does_not_block_writers();
     return 0;
 }

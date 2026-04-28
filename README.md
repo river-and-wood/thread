@@ -5,7 +5,7 @@
 ## 当前模块
 
 - `Mutex`：基于 `std::atomic_flag` 的自旋互斥锁。
-- `SharedMutex`：基于 `std::atomic<int>` 状态机的自旋读写锁。
+- `SharedMutex`：基于 `std::atomic<int>` 状态机和 writer ticket 的自旋读写锁。
 - `LockGuard`：互斥锁 RAII 守卫，构造时加锁，析构时解锁。
 - `SharedLockGuard`：共享读锁 RAII 守卫。
 - `UniqueLockGuard`：独占写锁 RAII 守卫。
@@ -46,7 +46,8 @@ void unlock_shared();
 ├── examples
 │   └── lock_demo.cpp
 └── tests
-    └── lock_tests.cpp
+    ├── lock_tests.cpp
+    └── stress_tests.cpp
 ```
 
 ## 编译运行
@@ -58,6 +59,34 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+## 测试
+
+基础正确性测试：
+
+```bash
+./build/lock_tests
+```
+
+压力测试：
+
+```bash
+./build/stress_tests
+```
+
+全部 CTest 测试：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+当前压力测试覆盖：
+
+- `Mutex` 高并发计数递增。
+- `Mutex::try_lock()` 高竞争失败回退。
+- `SharedMutex` 多读多写混合压力。
+- `SharedMutex::try_lock_shared()` 高竞争读路径。
+- 读写锁不变量：写独占、读写互斥、多读并发、共享数据一致性。
+
 ## 文档
 
 - [C++11 并发接口与底层原理](docs/cpp11_concurrency_principles.md)
@@ -68,7 +97,6 @@ ctest --test-dir build --output-on-failure
 
 ## 后续可扩展方向
 
-- 给 `Mutex` 增加 `try_lock()`。
-- 给 `SharedMutex` 增加更严格的公平调度策略。
+- 给 `SharedMutex` 增加读写线程统一 FIFO 队列，进一步提升公平性。
 - 实现 `ThreadPool`，展示任务队列、条件变量和优雅退出。
 - 加入性能压测，对比 `std::mutex`、`std::shared_timed_mutex`。

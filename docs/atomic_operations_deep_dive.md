@@ -323,21 +323,39 @@ bool ok = state_.compare_exchange_strong(expected,
                                          std::memory_order_relaxed);
 ```
 
-本项目 `SharedMutex::try_lock()` 使用它：
+本项目 `SharedMutex::try_lock()` 使用它尝试把 `state_` 从空闲状态改成写锁状态。当前版本还会先通过 `next_writer_ticket_` 预留 writer ticket，避免 `try_lock()` 插队到已经排队的写线程前面：
 
 ```cpp
 int expected_state = 0;
-return state_.compare_exchange_strong(expected_state,
-                                      -1,
-                                      std::memory_order_acquire,
-                                      std::memory_order_relaxed);
+const unsigned long long serving_ticket =
+    serving_writer_ticket_.load(std::memory_order_acquire);
+unsigned long long expected_next_ticket = serving_ticket;
+
+if (!next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
+                                                 serving_ticket + 1,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_relaxed)) {
+    return false;
+}
+
+const bool locked = state_.compare_exchange_strong(expected_state,
+                                                   -1,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed);
+
+if (!locked) {
+    serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+return locked;
 ```
 
 含义：
 
 ```text
+如果没有写线程排队，先预留当前 serving ticket
 如果 state_ 当前为 0，就改成 -1，表示写线程获得锁
-如果 state_ 当前不是 0，不修改 state_，返回 false
+如果 state_ 当前不是 0，不修改 state_，并跳过刚才预留但未使用的 ticket
 ```
 
 为什么适合 `try_lock()`：
@@ -688,6 +706,9 @@ locked_.clear(std::memory_order_release)
 ### 12.4 SharedMutex::lock
 
 ```cpp
+const unsigned long long my_ticket =
+    next_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+
 waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
 state_.compare_exchange_weak(expected_state, -1,
                              std::memory_order_acquire,
@@ -697,13 +718,18 @@ waiting_writers_.fetch_sub(1, std::memory_order_acq_rel);
 
 作用：
 
-- `fetch_add` 标记有写线程等待。
+- `next_writer_ticket_.fetch_add` 给写线程分配 FIFO ticket。
+- `waiting_writers_.fetch_add` 标记有写线程等待。
 - CAS 把空闲状态改成写锁状态。
 - `fetch_sub` 表示当前写线程不再处于等待状态。
 
 ### 12.5 SharedMutex::try_lock
 
 ```cpp
+next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
+                                            serving_ticket + 1,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_relaxed);
 state_.compare_exchange_strong(expected_state, -1,
                                std::memory_order_acquire,
                                std::memory_order_relaxed);
@@ -713,17 +739,21 @@ state_.compare_exchange_strong(expected_state, -1,
 
 - 只在 `state_ == 0` 时获得写锁。
 - 不阻塞等待。
+- 不插队到已经领取 writer ticket 的写线程前面。
+- 如果预留 ticket 后没有成功拿到写锁，会推进 `serving_writer_ticket_`，避免后续写线程卡住。
 
 ### 12.6 SharedMutex::unlock
 
 ```cpp
 state_.store(0, std::memory_order_release);
+serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 作用：
 
 - 释放写锁。
 - 让后续读线程或写线程能观察到空闲状态。
+- 推进 writer ticket，让下一个写线程有资格竞争。
 
 ### 12.7 SharedMutex::lock_shared
 
