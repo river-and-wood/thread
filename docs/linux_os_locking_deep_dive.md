@@ -380,15 +380,16 @@ state_ > 0  : reader count
 W 长时间拿不到写锁
 ```
 
-本项目使用 `waiting_writers_` 做简化写优先：
+本项目使用统一 ticket FIFO 做公平控制：
 
 ```text
-写线程等待时 waiting_writers_ > 0
-新的读线程看到 waiting_writers_ > 0 后暂缓进入
-已有读线程退出后，写线程更容易获得锁
+读请求和写请求都先领取 ticket
+只有 serving_ticket_ 轮到自己时才尝试进入
+读线程成功进入后立即推进 ticket
+写线程持有 ticket 到 unlock()
 ```
 
-这不是严格公平队列，但能解释写优先策略的核心思想。
+这样可以避免后来的读线程越过已经排队的写线程，同时允许排在写线程前面的连续读线程形成并发读批次。
 
 严格公平读写锁通常需要：
 

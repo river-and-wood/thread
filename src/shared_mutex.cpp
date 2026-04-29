@@ -6,29 +6,21 @@ namespace concurrency {
 
 SharedMutex::SharedMutex()
     : state_(0),
-      waiting_writers_(0),
-      next_writer_ticket_(0),
-      serving_writer_ticket_(0) {
+      next_ticket_(0),
+      serving_ticket_(0) {
     // state_ = 0 表示初始时没有读线程，也没有写线程。
-    // waiting_writers_ = 0 表示初始时没有等待写锁的线程。
-    // writer ticket 从 0 开始递增，serving ticket 表示当前轮到哪个写线程。
+    // next_ticket_ 和 serving_ticket_ 从 0 开始，表示还没有任何排队请求。
 }
 
 void SharedMutex::lock() {
-    // 写线程先领取一个全局递增 ticket。
-    // 这个 ticket 决定多个写线程之间的进入顺序。
+    // 写线程领取全局统一 ticket。
+    // 读请求和写请求都从 next_ticket_ 取号，因此不会互相插队。
     const unsigned long long my_ticket =
-        next_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
-
-    // 当前线程准备申请写锁，先登记为等待写线程。
-    // 新来的读线程看到 waiting_writers_ > 0 后会暂缓进入，
-    // 这样可以降低写线程被连续读线程饿死的概率。
-    waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
+        next_ticket_.fetch_add(1, std::memory_order_acq_rel);
 
     for (;;) {
-        // 如果还没有轮到自己的 ticket，当前写线程不能竞争 state_。
-        // 这样可以避免多个写线程同时 CAS state_，保证写线程 FIFO。
-        if (serving_writer_ticket_.load(std::memory_order_acquire) != my_ticket) {
+        // 只有轮到自己的 ticket 时，写线程才允许竞争 state_。
+        if (serving_ticket_.load(std::memory_order_acquire) != my_ticket) {
             std::this_thread::yield();
             continue;
         }
@@ -43,8 +35,7 @@ void SharedMutex::lock() {
                                          -1,
                                          std::memory_order_acquire,
                                          std::memory_order_relaxed)) {
-            // 已经成功拿到写锁，不再属于“等待写锁”的线程。
-            waiting_writers_.fetch_sub(1, std::memory_order_acq_rel);
+            // 写线程持有 ticket，直到 unlock() 时才推进 serving_ticket_。
             return;
         }
 
@@ -58,18 +49,17 @@ bool SharedMutex::try_lock() {
     // expected_state 被设置为 0，表示只有完全空闲时才能拿到写锁。
     int expected_state = 0;
 
-    // try_lock 也必须遵守 writer ticket。
-    // 只有 next_writer_ticket_ == serving_writer_ticket_ 时，才说明没有写线程排队。
+    // try_lock 也必须遵守统一 ticket。
+    // 只有 next_ticket_ == serving_ticket_ 时，才说明当前没有排队请求。
     const unsigned long long serving_ticket =
-        serving_writer_ticket_.load(std::memory_order_acquire);
+        serving_ticket_.load(std::memory_order_acquire);
     unsigned long long expected_next_ticket = serving_ticket;
 
-    // 预留当前 serving ticket。预留失败说明已有写线程领取了 ticket，
-    // 当前 try_lock 不能插队，直接失败。
-    if (!next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
-                                                     serving_ticket + 1,
-                                                     std::memory_order_acq_rel,
-                                                     std::memory_order_relaxed)) {
+    // 预留当前 serving ticket。预留失败说明已有请求排队，当前 try_lock 不能插队。
+    if (!next_ticket_.compare_exchange_strong(expected_next_ticket,
+                                             serving_ticket + 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
         return false;
     }
 
@@ -81,9 +71,9 @@ bool SharedMutex::try_lock() {
 
     if (!locked) {
         // 已经预留了一个 ticket，但没有拿到锁。
-        // 必须推进 serving_writer_ticket_ 跳过这个未使用的 ticket，
+        // 必须推进 serving_ticket_ 跳过这个未使用的 ticket，
         // 否则后续写线程会永远等在这个 ticket 上。
-        serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+        serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
     }
 
     return locked;
@@ -94,15 +84,20 @@ void SharedMutex::unlock() {
     // release 发布写临界区内对共享数据的修改。
     state_.store(0, std::memory_order_release);
 
-    // 所有写线程都持有一个 writer ticket。
+    // 写线程持有一个统一 ticket。
     // 释放写锁后推进 ticket，让下一个写线程有资格竞争。
-    serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+    serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void SharedMutex::lock_shared() {
+    // 读线程同样领取全局统一 ticket。
+    // 如果它排在某个写线程后面，就必须等待该写线程完成。
+    const unsigned long long my_ticket =
+        next_ticket_.fetch_add(1, std::memory_order_acq_rel);
+
     for (;;) {
-        // 简单写优先策略：有写线程等待时，新的读线程暂缓进入。
-        if (waiting_writers_.load(std::memory_order_acquire) > 0) {
+        // 未轮到自己的 ticket 时不能进入。
+        if (serving_ticket_.load(std::memory_order_acquire) != my_ticket) {
             std::this_thread::yield();
             continue;
         }
@@ -124,6 +119,9 @@ void SharedMutex::lock_shared() {
                                          std::memory_order_acquire,
                                          std::memory_order_relaxed)) {
             // CAS 成功后，当前线程已经计入读者数量，可以进入共享临界区。
+            // 读线程进入后立即推进 serving_ticket_，允许后续连续读线程形成并发读批次。
+            // 如果后续是写线程，它会看到 state_ > 0，并等待所有读线程退出。
+            serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
             return;
         }
 
@@ -133,8 +131,16 @@ void SharedMutex::lock_shared() {
 }
 
 bool SharedMutex::try_lock_shared() {
-    // 有写线程正在等待时，新的读线程不插队。
-    if (waiting_writers_.load(std::memory_order_acquire) > 0) {
+    // try_lock_shared 也不能插队。
+    // 只有没有任何排队请求时，它才尝试预留当前 serving ticket。
+    const unsigned long long serving_ticket =
+        serving_ticket_.load(std::memory_order_acquire);
+    unsigned long long expected_next_ticket = serving_ticket;
+
+    if (!next_ticket_.compare_exchange_strong(expected_next_ticket,
+                                             serving_ticket + 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
         return false;
     }
 
@@ -148,10 +154,14 @@ bool SharedMutex::try_lock_shared() {
                                          current_state + 1,
                                          std::memory_order_acquire,
                                          std::memory_order_relaxed)) {
+            // 读线程进入后马上推进 ticket，让后续请求继续按 FIFO 检查。
+            serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
             return true;
         }
     }
 
+    // 已经预留了 ticket，但当前有写线程持锁，必须跳过这个 ticket。
+    serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
     return false;
 }
 

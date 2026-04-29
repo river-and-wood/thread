@@ -5,7 +5,7 @@
 ## 当前模块
 
 - `Mutex`：基于 `std::atomic_flag` 的自旋互斥锁。
-- `SharedMutex`：基于 `std::atomic<int>` 状态机和 writer ticket 的自旋读写锁。
+- `SharedMutex`：基于 `std::atomic<int>` 状态机和读写统一 ticket FIFO 的自旋读写锁。
 - `LockGuard`：互斥锁 RAII 守卫，构造时加锁，析构时解锁。
 - `SharedLockGuard`：共享读锁 RAII 守卫。
 - `UniqueLockGuard`：独占写锁 RAII 守卫。
@@ -97,6 +97,5 @@ ctest --test-dir build --output-on-failure
 
 ## 后续可扩展方向
 
-- 给 `SharedMutex` 增加读写线程统一 FIFO 队列，进一步提升公平性。
 - 实现 `ThreadPool`，展示任务队列、条件变量和优雅退出。
 - 加入性能压测，对比 `std::mutex`、`std::shared_timed_mutex`。

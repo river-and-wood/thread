@@ -87,6 +87,10 @@ void stress_mutex_try_lock() {
             for (int step = 0; step < increments_per_thread; ++step) {
                 if (counter_mutex.try_lock()) {
                     ++shared_counter;
+                    if ((step % 16) == 0) {
+                        // 偶尔在持锁状态下让出时间片，稳定制造 try_lock 失败路径。
+                        std::this_thread::yield();
+                    }
                     counter_mutex.unlock();
                 } else {
                     // try_lock 失败后走阻塞 lock 路径，保证每次循环最终都会完成递增。

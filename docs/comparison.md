@@ -43,8 +43,7 @@
 | 读锁状态 | 实现内部维护 | `state_ > 0` 表示读者数量 |
 | 写锁状态 | 实现内部维护 | `state_ == -1` 表示写线程持锁 |
 | 空闲状态 | 实现内部维护 | `state_ == 0` |
-| 写优先 | 实现相关 | 通过 `waiting_writers_` 做简化写优先 |
-| 写线程顺序 | 实现相关 | 所有写线程通过 writer ticket 进入，阻塞式写线程 FIFO，`try_lock()` 不插队 |
+| 公平策略 | 实现相关 | 读写请求共享统一 ticket FIFO，`try_lock()` 不插队 |
 | 阻塞等待 | 通常可阻塞睡眠 | 自旋 + `yield()` |
 | 超时共享锁 | 标准 timed 版本支持 | 暂不支持 |
 
@@ -237,15 +236,15 @@ concurrency::Mutex::unlock()
 
 ```text
 写线程:
-    领取 writer ticket
-    waiting_writers_++
+    领取统一 ticket
     等待 serving ticket 轮到自己
     循环 CAS: state_ 0 -> -1
-    成功后 waiting_writers_--
 
 读线程:
-    如果 waiting_writers_ > 0，暂缓进入
+    领取统一 ticket
+    等待 serving ticket 轮到自己
     如果 state_ >= 0，CAS: state_ -> state_ + 1
+    成功后立即推进 serving ticket，让连续读者形成批次
     如果 state_ == -1，等待
 ```
 
@@ -258,7 +257,7 @@ concurrency::Mutex::unlock()
 ```
 
 但它没有等待队列，所以不能做到标准库那样成熟的阻塞唤醒和公平调度。
-当前版本增加了 writer ticket，能够保证阻塞式写线程之间 FIFO，但读线程和写线程之间仍采用简化写优先策略。
+当前版本使用统一 ticket，能够避免后来的读线程越过已经排队的写线程，但仍是用户态自旋实现，没有标准库锁那样的内核阻塞等待。
 
 ## 9. 什么时候用哪种实现
 

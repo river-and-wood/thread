@@ -140,8 +140,8 @@ void test_shared_mutex_try_lock() {
 }
 
 void test_shared_mutex_failed_try_lock_does_not_block_writers() {
-    // 这个测试覆盖 writer ticket 的边界情况：
-    // try_lock 会先预留一个 writer ticket，如果随后因为读锁存在而失败，
+    // 这个测试覆盖统一 ticket 的边界情况：
+    // try_lock 会先预留一个 ticket，如果随后因为读锁存在而失败，
     // 它必须推进 serving ticket 跳过这个未使用 ticket。
     concurrency::SharedMutex shared_mutex;
     std::atomic<bool> writer_finished(false);
@@ -164,6 +164,53 @@ void test_shared_mutex_failed_try_lock_does_not_block_writers() {
     assert(writer_finished.load());
 }
 
+void test_shared_mutex_reader_does_not_bypass_queued_writer() {
+    // 先持有一个读锁，让后续写线程排队等待。
+    // 再启动一个更晚到达的读线程。统一 FIFO 下，后来的读线程不能越过写线程。
+    concurrency::SharedMutex shared_mutex;
+    std::atomic<bool> writer_entered(false);
+    std::atomic<bool> writer_can_finish(false);
+    std::atomic<bool> late_reader_entered_before_writer(false);
+
+    shared_mutex.lock_shared();
+
+    std::thread writer([&]() {
+        concurrency::UniqueLockGuard<concurrency::SharedMutex> write_guard(shared_mutex);
+        writer_entered.store(true, std::memory_order_release);
+
+        while (!writer_can_finish.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    // 给写线程时间领取 ticket 并阻塞在已有读锁后面。
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    std::thread late_reader([&]() {
+        concurrency::SharedLockGuard<concurrency::SharedMutex> read_guard(shared_mutex);
+        if (!writer_entered.load(std::memory_order_acquire)) {
+            late_reader_entered_before_writer.store(true, std::memory_order_release);
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    assert(!writer_entered.load(std::memory_order_acquire));
+    assert(!late_reader_entered_before_writer.load(std::memory_order_acquire));
+
+    shared_mutex.unlock_shared();
+
+    while (!writer_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    assert(!late_reader_entered_before_writer.load(std::memory_order_acquire));
+    writer_can_finish.store(true, std::memory_order_release);
+
+    writer.join();
+    late_reader.join();
+    assert(!late_reader_entered_before_writer.load(std::memory_order_acquire));
+}
+
 } // namespace
 
 int main() {
@@ -173,5 +220,6 @@ int main() {
     test_shared_mutex_writer_is_exclusive();
     test_shared_mutex_try_lock();
     test_shared_mutex_failed_try_lock_does_not_block_writers();
+    test_shared_mutex_reader_does_not_bypass_queued_writer();
     return 0;
 }

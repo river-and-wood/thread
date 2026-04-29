@@ -18,7 +18,7 @@ namespace concurrency {
 // 状态模型：
 // - 读线程只要没有写线程持锁，就可以共同进入。
 // - 写线程必须等到没有读线程、也没有其他写线程时才能进入。
-// - 多个写线程会按 ticket 顺序获取写锁，避免写线程之间无序竞争。
+// - 读请求和写请求共享同一套 ticket 队列，避免后来的读线程越过已排队写线程。
 class SharedMutex : private NonCopyable {
 public:
     SharedMutex();
@@ -37,7 +37,7 @@ public:
     void lock_shared();
 
     // 尝试获取共享读锁。
-    // 返回 true 表示获取成功，返回 false 表示当前有写线程活跃或等待。
+    // 返回 true 表示获取成功，返回 false 表示当前有写线程活跃或已有请求排队。
     bool try_lock_shared();
 
     // 释放共享读锁。
@@ -53,23 +53,14 @@ private:
     // 可以用 CAS 一次性完成状态检查和状态修改，避免多个变量不一致。
     std::atomic<int> state_;
 
-    // 正在等待写锁的线程数量。
-    // 读线程会观察这个值：只要存在等待写线程，新的读线程先不进入，
-    // 这样可以降低写线程长时间饥饿的概率。
-    //
-    // 这是一个简化写优先策略，不是严格 FIFO 公平队列。
-    std::atomic<int> waiting_writers_;
+    // 下一个读/写请求要领取的 ticket。
+    // lock() 和 lock_shared() 都会通过它取号，形成统一 FIFO 队列。
+    std::atomic<unsigned long long> next_ticket_;
 
-    // 下一个写线程要领取的 ticket。
-    // 每个调用 lock() 的写线程都会通过 fetch_add 获取一个唯一编号。
-    std::atomic<unsigned long long> next_writer_ticket_;
-
-    // 当前允许尝试获取写锁的 ticket。
-    // 只有 my_ticket == serving_writer_ticket_ 的写线程才允许竞争 state_。
-    std::atomic<unsigned long long> serving_writer_ticket_;
-
-    // 所有写线程都必须通过 writer ticket 进入。
-    // lock() 会等待自己的 ticket，try_lock() 只有在没有排队写线程时才会预留当前 ticket。
+    // 当前正在服务的 ticket。
+    // 写线程会持有这个 ticket 直到 unlock()；读线程进入后会立刻推进它，
+    // 这样连续排队的读线程可以依次进入并形成并发读批次。
+    std::atomic<unsigned long long> serving_ticket_;
 };
 
 } // namespace concurrency

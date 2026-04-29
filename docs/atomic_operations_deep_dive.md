@@ -179,7 +179,8 @@ STLXR 尝试写入 true
 
 ```cpp
 std::atomic<int> state_;
-std::atomic<int> waiting_writers_;
+std::atomic<unsigned long long> next_ticket_;
+std::atomic<unsigned long long> serving_ticket_;
 ```
 
 `state_` 表示读写锁主状态：
@@ -190,7 +191,7 @@ state_ == 0 : 空闲
 state_ > 0  : 读线程数量
 ```
 
-`waiting_writers_` 表示正在等待写锁的线程数量。
+`next_ticket_` 和 `serving_ticket_` 组成读写统一 FIFO 队列。读请求和写请求都从 `next_ticket_` 领取编号，只有轮到 `serving_ticket_` 时才能尝试进入。
 
 ### 4.1 load
 
@@ -242,30 +243,31 @@ state_.store(0, std::memory_order_release);
 接口：
 
 ```cpp
-int old = waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
+unsigned long long old = next_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 语义：
 
 ```text
-old = waiting_writers_
-waiting_writers_ = waiting_writers_ + 1
+old = next_ticket_
+next_ticket_ = next_ticket_ + 1
 return old
 ```
 
 读取旧值和加 1 写回是一个原子读改写操作。
 
-本项目写线程等待前：
+本项目读线程和写线程排队前：
 
 ```cpp
-waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
+const unsigned long long my_ticket =
+    next_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 作用：
 
-- 告诉读线程：现在有写线程准备进入。
-- 新读线程看到 `waiting_writers_ > 0` 后暂缓进入。
-- 降低写线程被源源不断的新读线程饿死的概率。
+- 给每个读/写请求分配唯一 ticket。
+- 让所有请求按到达顺序排队。
+- 防止后来的读线程越过已经排队的写线程。
 
 ### 4.4 fetch_sub
 
@@ -323,18 +325,18 @@ bool ok = state_.compare_exchange_strong(expected,
                                          std::memory_order_relaxed);
 ```
 
-本项目 `SharedMutex::try_lock()` 使用它尝试把 `state_` 从空闲状态改成写锁状态。当前版本还会先通过 `next_writer_ticket_` 预留 writer ticket，避免 `try_lock()` 插队到已经排队的写线程前面：
+本项目 `SharedMutex::try_lock()` 使用它尝试把 `state_` 从空闲状态改成写锁状态。当前版本还会先通过 `next_ticket_` 预留统一 ticket，避免 `try_lock()` 插队到已经排队的读/写请求前面：
 
 ```cpp
 int expected_state = 0;
 const unsigned long long serving_ticket =
-    serving_writer_ticket_.load(std::memory_order_acquire);
+    serving_ticket_.load(std::memory_order_acquire);
 unsigned long long expected_next_ticket = serving_ticket;
 
-if (!next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
-                                                 serving_ticket + 1,
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_relaxed)) {
+if (!next_ticket_.compare_exchange_strong(expected_next_ticket,
+                                          serving_ticket + 1,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_relaxed)) {
     return false;
 }
 
@@ -344,7 +346,7 @@ const bool locked = state_.compare_exchange_strong(expected_state,
                                                    std::memory_order_relaxed);
 
 if (!locked) {
-    serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+    serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 return locked;
@@ -707,29 +709,25 @@ locked_.clear(std::memory_order_release)
 
 ```cpp
 const unsigned long long my_ticket =
-    next_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+    next_ticket_.fetch_add(1, std::memory_order_acq_rel);
 
-waiting_writers_.fetch_add(1, std::memory_order_acq_rel);
 state_.compare_exchange_weak(expected_state, -1,
                              std::memory_order_acquire,
                              std::memory_order_relaxed);
-waiting_writers_.fetch_sub(1, std::memory_order_acq_rel);
 ```
 
 作用：
 
-- `next_writer_ticket_.fetch_add` 给写线程分配 FIFO ticket。
-- `waiting_writers_.fetch_add` 标记有写线程等待。
+- `next_ticket_.fetch_add` 给写线程分配统一 FIFO ticket。
 - CAS 把空闲状态改成写锁状态。
-- `fetch_sub` 表示当前写线程不再处于等待状态。
 
 ### 12.5 SharedMutex::try_lock
 
 ```cpp
-next_writer_ticket_.compare_exchange_strong(expected_next_ticket,
-                                            serving_ticket + 1,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_relaxed);
+next_ticket_.compare_exchange_strong(expected_next_ticket,
+                                     serving_ticket + 1,
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_relaxed);
 state_.compare_exchange_strong(expected_state, -1,
                                std::memory_order_acquire,
                                std::memory_order_relaxed);
@@ -739,50 +737,59 @@ state_.compare_exchange_strong(expected_state, -1,
 
 - 只在 `state_ == 0` 时获得写锁。
 - 不阻塞等待。
-- 不插队到已经领取 writer ticket 的写线程前面。
-- 如果预留 ticket 后没有成功拿到写锁，会推进 `serving_writer_ticket_`，避免后续写线程卡住。
+- 不插队到已经领取统一 ticket 的读/写请求前面。
+- 如果预留 ticket 后没有成功拿到写锁，会推进 `serving_ticket_`，避免后续请求卡住。
 
 ### 12.6 SharedMutex::unlock
 
 ```cpp
 state_.store(0, std::memory_order_release);
-serving_writer_ticket_.fetch_add(1, std::memory_order_acq_rel);
+serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 作用：
 
 - 释放写锁。
 - 让后续读线程或写线程能观察到空闲状态。
-- 推进 writer ticket，让下一个写线程有资格竞争。
+- 推进统一 ticket，让下一个读/写请求有资格竞争。
 
 ### 12.7 SharedMutex::lock_shared
 
 ```cpp
-waiting_writers_.load(std::memory_order_acquire);
+serving_ticket_.load(std::memory_order_acquire);
 state_.load(std::memory_order_acquire);
 state_.compare_exchange_weak(current_state, current_state + 1,
                              std::memory_order_acquire,
                              std::memory_order_relaxed);
+serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 作用：
 
-- 先观察是否有写线程等待。
+- 先等待自己的统一 ticket。
 - 再观察是否有写线程持锁。
 - CAS 成功后读者数量加 1。
+- 读线程进入后推进 ticket，让后续连续读线程可以组成并发读批次。
 
 ### 12.8 SharedMutex::try_lock_shared
 
 ```cpp
+next_ticket_.compare_exchange_strong(expected_next_ticket,
+                                     serving_ticket + 1,
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_relaxed);
 state_.compare_exchange_weak(current_state, current_state + 1,
                              std::memory_order_acquire,
                              std::memory_order_relaxed);
+serving_ticket_.fetch_add(1, std::memory_order_acq_rel);
 ```
 
 作用：
 
-- 只在没有写锁活跃、没有写线程等待时尝试进入。
+- 只在没有其他读/写请求排队时尝试进入。
+- 如果已经有请求排队，直接失败，不插队。
 - 成功后共享读者数量增加。
+- 成功进入后推进 ticket，让后续请求继续。
 
 ### 12.9 SharedMutex::unlock_shared
 
