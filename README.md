@@ -89,9 +89,14 @@ ctest --test-dir build --output-on-failure
 
 ## 文档
 
+- [文档阅读路线](docs/README.md)
+- [源码阅读建议](docs/source_reading_guide.md)
+- [ThreadLearning 常见问题详解](docs/threadlearning_questions.md)
+- [C++11 内存序与 RAII 统一详解](docs/memory_order_raii_deep_dive.md)
 - [C++11 并发接口与底层原理](docs/cpp11_concurrency_principles.md)
 - [Linux/操作系统视角下的锁底层原理](docs/linux_os_locking_deep_dive.md)
 - [C++11 原子操作底层原理与实现](docs/atomic_operations_deep_dive.md)
+- [锁的其他底层实现方式](docs/low_level_lock_primitives.md)
 - [本项目锁实现方式](docs/project_implementation.md)
 - [标准库并发接口与本项目实现对比](docs/comparison.md)
 
