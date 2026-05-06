@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(concurrency_locks
     src/mutex.cpp
     src/shared_mutex.cpp
+    src/thread_pool.cpp
 )
 
 target_include_directories(concurrency_locks
@@ -35,6 +36,10 @@ target_link_libraries(lock_tests PRIVATE concurrency_locks)
 add_executable(stress_tests tests/stress_tests.cpp)
 target_link_libraries(stress_tests PRIVATE concurrency_locks)
 
+add_executable(thread_pool_tests tests/thread_pool_tests.cpp)
+target_link_libraries(thread_pool_tests PRIVATE concurrency_locks)
+
 enable_testing()
 add_test(NAME lock_tests COMMAND lock_tests)
 add_test(NAME stress_tests COMMAND stress_tests)
+add_test(NAME thread_pool_tests COMMAND thread_pool_tests)
